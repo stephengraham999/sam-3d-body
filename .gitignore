@@ -110,6 +110,8 @@ lightning_logs/
 results/
 sandbox/
 debug/
+output/
+.gui_pid
 
 # Project-specific: Local tools
 .sl/
