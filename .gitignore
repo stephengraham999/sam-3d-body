@@ -119,3 +119,6 @@ debug/
 **/.dist_test
 sandbox*
 *.sh
+
+# Allow tracked installer shell scripts
+!installer/*.sh

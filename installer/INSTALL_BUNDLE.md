@@ -82,6 +82,37 @@ No Hugging Face token is needed during this offline install.
 
 ---
 
+## 4) Build a standalone installer app folder (includes dependencies folder)
+
+If you want a **single self-contained installer app folder** that includes:
+
+- app snapshot
+- dependencies folder (wheels + checkpoints + sources)
+- one `install.sh`
+
+run:
+
+```bash
+bash installer/build_standalone_installer_macos.sh
+```
+
+This creates:
+
+- `standalone_installer/macos-apple-silicon/`
+  - `app/`
+  - `dependencies/`
+  - `install.sh`
+  - `README_STANDALONE.md`
+- `standalone_installer/macos-apple-silicon.tar.gz`
+
+To install from that standalone folder:
+
+```bash
+bash standalone_installer/macos-apple-silicon/install.sh
+```
+
+---
+
 ## Notes / constraints
 
 - Wheels are platform-specific. This bundle is for **macOS arm64** only.
