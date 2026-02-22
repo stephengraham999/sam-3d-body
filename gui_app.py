@@ -1,5 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
+from __future__ import annotations
+
 import argparse
 import os
 import signal
@@ -10,6 +12,7 @@ from datetime import datetime
 from typing import Any
 
 import cv2
+import numpy as np
 import gradio as gr
 
 from sam_3d_body import render_npz_to_files, run_fast_infer
@@ -26,7 +29,6 @@ def _write_pid() -> None:
 
 
 def _kill_stale(port: int) -> None:
-    """Best-effort kill of a previous GUI process occupying *port*."""
     try:
         out = subprocess.check_output(
             ["lsof", "-tiTCP:" + str(port), "-sTCP:LISTEN"],
@@ -40,7 +42,6 @@ def _kill_stale(port: int) -> None:
                 time.sleep(0.3)
     except Exception:
         pass
-    # Also check PID file
     if os.path.exists(_PID_FILE):
         try:
             old_pid = int(open(_PID_FILE).read().strip())
@@ -51,11 +52,103 @@ def _kill_stale(port: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Gradio value helpers
+# Skeleton drawing
 # ---------------------------------------------------------------------------
 
+# Body links: (joint_a, joint_b, BGR_color) using mhr70 indices
+# 0=nose,1=l_eye,2=r_eye,3=l_ear,4=r_ear,5=l_shoulder,6=r_shoulder,
+# 7=l_elbow,8=r_elbow,9=l_hip,10=r_hip,11=l_knee,12=r_knee,
+# 13=l_ankle,14=r_ankle,15=l_big_toe,16=l_small_toe,17=l_heel,
+# 18=r_big_toe,19=r_small_toe,20=r_heel,41=r_wrist,62=l_wrist,69=neck
+_BODY_LINKS = [
+    # legs
+    (13, 11, (0, 200, 0)),
+    (11, 9,  (0, 200, 0)),
+    (14, 12, (0, 100, 255)),
+    (12, 10, (0, 100, 255)),
+    # hips / torso
+    (9, 10,  (51, 153, 255)),
+    (5, 9,   (51, 153, 255)),
+    (6, 10,  (51, 153, 255)),
+    (5, 6,   (51, 153, 255)),
+    # arms
+    (5, 7,   (0, 200, 0)),
+    (7, 62,  (0, 200, 0)),
+    (6, 8,   (0, 100, 255)),
+    (8, 41,  (0, 100, 255)),
+    # head
+    (0, 1,   (51, 153, 255)),
+    (0, 2,   (51, 153, 255)),
+    (1, 2,   (51, 153, 255)),
+    (1, 3,   (51, 153, 255)),
+    (2, 4,   (51, 153, 255)),
+    (3, 5,   (51, 153, 255)),
+    (4, 6,   (51, 153, 255)),
+    # feet
+    (13, 15, (0, 200, 0)),
+    (13, 16, (0, 200, 0)),
+    (13, 17, (0, 200, 0)),
+    (14, 18, (0, 100, 255)),
+    (14, 19, (0, 100, 255)),
+    (14, 20, (0, 100, 255)),
+]
+_BODY_KPT_INDICES = list(range(21)) + [41, 62, 69]  # main body joints
+
+
+def draw_skeleton_image(img_path: str, npz_path: str) -> np.ndarray | None:
+    """Draw 2D keypoints + skeleton lines on the image. Returns RGB array."""
+    img_bgr = cv2.imread(img_path)
+    if img_bgr is None:
+        return None
+    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).copy()
+
+    try:
+        z = np.load(npz_path, allow_pickle=False)
+        num_people = int(z["num_people"])
+    except Exception:
+        return img
+
+    img_h, img_w = img.shape[:2]
+    line_w = max(2, img_w // 500)
+    dot_r  = max(4, img_w // 250)
+
+    for pid in range(num_people):
+        prefix = f"person_{pid:03d}_"
+        key = prefix + "pred_keypoints_2d"
+        if key not in z:
+            continue
+        kpts = z[key]  # (N, 2) in original image coordinates
+
+        # Draw limb lines
+        for ja, jb, color in _BODY_LINKS:
+            if ja >= len(kpts) or jb >= len(kpts):
+                continue
+            x1, y1 = int(round(kpts[ja, 0])), int(round(kpts[ja, 1]))
+            x2, y2 = int(round(kpts[jb, 0])), int(round(kpts[jb, 1]))
+            if (0 <= x1 < img_w and 0 <= y1 < img_h and
+                    0 <= x2 < img_w and 0 <= y2 < img_h):
+                cv2.line(img, (x1, y1), (x2, y2), color[::-1], line_w, cv2.LINE_AA)
+
+        # Draw joint dots
+        for idx in _BODY_KPT_INDICES:
+            if idx >= len(kpts):
+                continue
+            x, y = int(round(kpts[idx, 0])), int(round(kpts[idx, 1]))
+            if 0 <= x < img_w and 0 <= y < img_h:
+                cv2.circle(img, (x, y), dot_r + 1, (0, 0, 0), -1)
+                cv2.circle(img, (x, y), dot_r, (255, 255, 255), -1)
+
+    return img
+
+
+def _load_image_rgb(path: str) -> np.ndarray | None:
+    img = cv2.imread(path)
+    if img is None:
+        return None
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
 def _collect_paths(value: Any) -> list[str]:
-    """Recursively extract filesystem paths from Gradio File component values."""
     paths: list[str] = []
     if value is None:
         return paths
@@ -75,15 +168,7 @@ def _collect_paths(value: Any) -> list[str]:
     return [str(value)]
 
 
-def _img_tuple(path: str):
-    img = cv2.imread(path)
-    if img is None:
-        return None
-    return (img[:, :, ::-1], os.path.basename(path))
-
-
 def _perf_str(summary: dict[str, Any]) -> str:
-    """Format a single-image performance summary into a readable string."""
     if summary.get("cache_hit"):
         cache_ms = summary.get("cache_ms") or 0
         return f"cache_hit cache_ms={cache_ms:.1f}"
@@ -92,6 +177,32 @@ def _perf_str(summary: dict[str, Any]) -> str:
     if save_ms is not None:
         return f"infer_ms={infer_ms:.1f} save_ms={save_ms:.1f}"
     return f"infer_ms={infer_ms:.1f} save=async"
+
+
+# ---------------------------------------------------------------------------
+# CSS
+# ---------------------------------------------------------------------------
+_CSS = """
+/* Fix left control panel width — never grows wider than 340px */
+#ctrl-col {
+    min-width: 280px !important;
+    max-width: 340px !important;
+    flex: 0 0 320px !important;
+}
+/* Make each image in the right panel fill its cell with no bottom thumbnail strip */
+#right-panel .image-container {
+    height: 100%;
+}
+#right-panel img {
+    object-fit: contain;
+    height: 100%;
+}
+/* Give each image row equal height */
+#right-panel .gr-row {
+    flex: 1 1 50%;
+    min-height: 300px;
+}
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -105,13 +216,29 @@ class ThinGui:
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def process(self, files, max_side, single_person, save_compressed, render_mesh, cache_dir, inference_type):
+    def process(
+        self,
+        files,
+        max_side,
+        single_person,
+        save_compressed,
+        render_mesh,
+        cache_dir,
+        inference_type,
+    ):
+        """
+        Returns:
+            orig_img, skel_img, mesh_img, side_img — numpy RGB arrays or None
+            status — str
+            npz_files — list[str] (hidden, for 3D viewer)
+        """
+        empty = (None, None, None, None, "No files selected.", [])
         if not files:
-            return [], [], [], "No files selected.", []
+            return empty
 
         image_paths = [f.name if hasattr(f, "name") else str(f) for f in files]
-        npz_dir = os.path.join(self.output_dir, "npz")
-        mesh_dir = os.path.join(self.output_dir, "render")
+        npz_dir   = os.path.join(self.output_dir, "npz")
+        mesh_dir  = os.path.join(self.output_dir, "render")
         debug_log = os.path.join(self.output_dir, "debug.log")
         os.makedirs(npz_dir, exist_ok=True)
         os.makedirs(mesh_dir, exist_ok=True)
@@ -121,10 +248,7 @@ class ThinGui:
                 f"\n[{datetime.now().isoformat()}] process start "
                 f"files={len(image_paths)} render_mesh={bool(render_mesh)}\n"
             )
-            for p in image_paths:
-                f.write(f"  image={p}\n")
 
-        # ---- Inference ----
         infer_type = str(inference_type).strip().lower() if inference_type else "full"
         if infer_type not in ("full", "body"):
             infer_type = "full"
@@ -142,15 +266,19 @@ class ThinGui:
             bbox_thr=0.8,
             inference_type=infer_type,
         )
-        summary_by_path = {str(entry.get("image_path")): entry for entry in infer_summary}
+        summary_by_path = {str(e.get("image_path")): e for e in infer_summary}
 
+        # We show the FIRST image's results in the 2×2 panel
         npz_files: list[str] = []
-        mesh_gallery: list[tuple] = []
-        side_gallery: list[tuple] = []
         render_notes: list[str] = []
 
+        orig_img  = None
+        skel_img  = None
+        mesh_img  = None
+        side_img  = None
+
         for img_path in image_paths:
-            stem = os.path.splitext(os.path.basename(img_path))[0]
+            stem     = os.path.splitext(os.path.basename(img_path))[0]
             npz_path = os.path.join(npz_dir, f"{stem}.npz")
 
             if not os.path.exists(npz_path):
@@ -159,17 +287,21 @@ class ThinGui:
                 continue
 
             npz_files.append(npz_path)
-            perf_info = summary_by_path.get(img_path, {})
-            perf = _perf_str(perf_info)
+            perf = _perf_str(summary_by_path.get(img_path, {}))
 
-            with open(debug_log, "a") as f:
-                f.write(f"  npz_ok={npz_path}\n")
+            # Original image (first result only, shown in top-left)
+            if orig_img is None:
+                orig_img = _load_image_rgb(img_path)
+
+            # 2D keypoints skeleton overlay (top-right)
+            if skel_img is None:
+                skel_img = draw_skeleton_image(img_path, npz_path)
 
             if not render_mesh:
                 render_notes.append(f"{stem}: render=skipped ({perf})")
                 continue
 
-            # ---- Render via subprocess (required on macOS: pyrender needs main thread) ----
+            # Mesh render (bottom row) — subprocess required on macOS
             try:
                 out_dir = os.path.join(mesh_dir, stem)
                 os.makedirs(out_dir, exist_ok=True)
@@ -188,7 +320,6 @@ class ThinGui:
                 side_path = os.path.join(out_dir, "mesh_side.jpg")
 
                 with open(debug_log, "a") as f:
-                    f.write(f"  render_cmd={' '.join(cmd)}\n")
                     f.write(f"  render_rc={proc.returncode} render_ms={render_ms:.1f}\n")
                     if proc.stderr:
                         f.write(f"  render_stderr={proc.stderr.strip()}\n")
@@ -196,18 +327,15 @@ class ThinGui:
                 if proc.returncode != 0:
                     raise RuntimeError(f"render subprocess rc={proc.returncode}")
                 if not (os.path.exists(mesh_path) and os.path.exists(side_path)):
-                    raise RuntimeError("render outputs missing on disk")
+                    raise RuntimeError("render outputs missing")
 
-                overlay_tuple = _img_tuple(mesh_path)
-                side_tuple = _img_tuple(side_path)
-                if overlay_tuple is not None:
-                    mesh_gallery.append(overlay_tuple)
-                if side_tuple is not None:
-                    side_gallery.append(side_tuple)
+                if mesh_img is None and os.path.exists(mesh_path):
+                    mesh_img = _load_image_rgb(mesh_path)
+                if side_img is None and os.path.exists(side_path):
+                    side_img = _load_image_rgb(side_path)
 
-                render_notes.append(
-                    f"{stem}: render=ok render_ms={render_ms:.1f} ({perf})"
-                )
+                render_notes.append(f"{stem}: render=ok render_ms={render_ms:.1f} ({perf})")
+
             except Exception as e:
                 with open(debug_log, "a") as f:
                     f.write(f"  render_exception={type(e).__name__}: {e}\n")
@@ -219,12 +347,12 @@ class ThinGui:
             f"render_mesh={bool(render_mesh)}"
         )
         if render_notes:
-            status += " | " + " ; ".join(render_notes)
+            status += " | " + " | ".join(render_notes)
         status += f" | debug_log={debug_log}"
-        return npz_files, mesh_gallery, side_gallery, status, npz_files
+
+        return orig_img, skel_img, mesh_img, side_img, status, npz_files
 
     def open_viewer(self, npz_files):
-        # Try to find a valid NPZ from Gradio value
         candidates = _collect_paths(npz_files)
         npz_path = ""
         for p in candidates:
@@ -232,22 +360,20 @@ class ThinGui:
                 npz_path = p
                 break
 
-        # Fallback: most recently modified NPZ from output folder
         if not npz_path:
             npz_dir = os.path.join(self.output_dir, "npz")
             if os.path.isdir(npz_dir):
-                npz_list = [
+                lst = [
                     os.path.join(npz_dir, f)
                     for f in os.listdir(npz_dir)
                     if f.lower().endswith(".npz")
                 ]
-                if npz_list:
-                    npz_path = max(npz_list, key=os.path.getmtime)
+                if lst:
+                    npz_path = max(lst, key=os.path.getmtime)
 
         if not npz_path:
             return "No NPZ file selected."
 
-        # Preflight: trimesh interactive viewer requires pyglet<2
         check = subprocess.run(
             [sys.executable, "-c", "import trimesh.viewer.windowed; print('ok')"],
             capture_output=True, text=True,
@@ -255,7 +381,7 @@ class ThinGui:
         if check.returncode != 0:
             return (
                 "3D viewer dependency missing. "
-                "Install with: pip install 'pyglet<2' (inside this venv). "
+                "Install with: pip install 'pyglet<2'. "
                 f"details={check.stderr.strip() or check.stdout.strip()}"
             )
 
@@ -270,10 +396,7 @@ class ThinGui:
             )
             return f"Opened 3D viewer for: {os.path.basename(npz_path)}"
         except Exception as e:
-            return (
-                f"Failed to open viewer: {type(e).__name__}: {e}. "
-                f"candidates={candidates}"
-            )
+            return f"Failed to open viewer: {type(e).__name__}: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -283,62 +406,110 @@ class ThinGui:
 def build_app(checkpoint_path: str, mhr_path: str, output_dir: str):
     runner = ThinGui(checkpoint_path, mhr_path, output_dir)
 
-    with gr.Blocks(title="SAM3D Thin GUI v3") as demo:
+    with gr.Blocks(title="SAM3D Thin GUI v3", css=_CSS) as demo:
         gr.Markdown("## SAM3D Thin GUI v3\nIn-process render · Estimator caching · Thread-safe")
         gr.Markdown(
             f"**Build:** thin-gui-v3  |  **PID:** {os.getpid()}  |  "
             f"**Checkpoint:** `{os.path.basename(checkpoint_path)}`"
         )
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                files = gr.File(label="Input JPEG/PNG", file_count="multiple", file_types=["image"])
-                max_side = gr.Slider(0, 2000, value=1280, step=32, label="max_side (0 disables resize)")
+        with gr.Row(equal_height=False):
+            # ----------------------------------------------------------------
+            # LEFT: fixed-width control panel
+            # ----------------------------------------------------------------
+            with gr.Column(elem_id="ctrl-col", min_width=300):
+                files = gr.File(
+                    label="Input JPEG/PNG",
+                    file_count="multiple",
+                    file_types=["image"],
+                )
+                max_side = gr.Slider(
+                    0, 2000, value=1280, step=32,
+                    label="max_side (0 disables resize)",
+                )
                 inference_type = gr.Radio(
                     choices=["full", "body"],
                     value="full",
                     label="Inference type (body=faster, no hand detail)",
                 )
-                single_person = gr.Checkbox(value=True, label="Single person mode")
+                single_person   = gr.Checkbox(value=True,  label="Single person mode")
                 save_compressed = gr.Checkbox(value=False, label="Compress NPZ (slower)")
-                render_mesh = gr.Checkbox(value=False, label="Also render mesh images")
-                cache_dir = gr.Textbox(value="./output/fast_npz_cache", label="Cache directory (optional)")
+                render_mesh     = gr.Checkbox(value=True,  label="Also render mesh images")
+                cache_dir = gr.Textbox(
+                    value="./output/fast_npz_cache",
+                    label="Cache directory (optional)",
+                )
 
-                with gr.Row():
-                    run_btn = gr.Button("Run", variant="primary")
-                    batch_preset_btn = gr.Button("⚡ Batch Preset", variant="secondary")
+                run_btn         = gr.Button("Run", variant="primary")
+                batch_preset_btn = gr.Button("⚡ Batch Preset", variant="secondary")
 
-                status = gr.Textbox(label="Status")
+                status = gr.Textbox(label="Status", lines=3)
 
-            with gr.Column(scale=2):
-                npz_files = gr.File(label="NPZ outputs", file_count="multiple")
-                mesh_gallery = gr.Gallery(label="Mesh overlay", columns=2, height=300)
-                side_gallery = gr.Gallery(label="Mesh side view", columns=2, height=300)
-                open_3d_btn = gr.Button("Open interactive 3D viewer (first NPZ)")
-                open_3d_status = gr.Textbox(label="3D Viewer")
+                gr.Markdown("---")
+                open_3d_btn    = gr.Button("Open interactive 3D viewer")
+                open_3d_status = gr.Textbox(label="3D Viewer", lines=1)
 
+                gr.Markdown("---")
+                # Hidden NPZ file list, exposed as download widget
+                npz_files = gr.File(
+                    label="Download NPZ output(s)",
+                    file_count="multiple",
+                    interactive=False,
+                )
+
+            # ----------------------------------------------------------------
+            # RIGHT: 2×2 image grid
+            # ----------------------------------------------------------------
+            with gr.Column(elem_id="right-panel", scale=3):
+                with gr.Row(equal_height=True):
+                    orig_img = gr.Image(
+                        label="Original photo",
+                        type="numpy",
+                        show_download_button=False,
+                    )
+                    skel_img = gr.Image(
+                        label="2D keypoints",
+                        type="numpy",
+                        show_download_button=False,
+                    )
+                with gr.Row(equal_height=True):
+                    mesh_img = gr.Image(
+                        label="Mesh overlay",
+                        type="numpy",
+                        show_download_button=False,
+                    )
+                    side_img = gr.Image(
+                        label="Mesh side view",
+                        type="numpy",
+                        show_download_button=False,
+                    )
+
+        # ----------------------------------------------------------------
+        # Batch preset
+        # ----------------------------------------------------------------
         def apply_batch_preset():
-            """Set controls for maximum batch throughput."""
             return (
-                960,       # max_side
-                "body",    # inference_type
-                True,      # single_person
-                False,     # save_compressed
-                False,     # render_mesh
-                "",        # cache_dir (skip hashing overhead)
+                960,    # max_side
+                "body", # inference_type
+                True,   # single_person
+                False,  # save_compressed
+                False,  # render_mesh
+                "",     # cache_dir
             )
 
         batch_preset_btn.click(
             fn=apply_batch_preset,
             inputs=[],
-            outputs=[max_side, inference_type, single_person, save_compressed, render_mesh, cache_dir],
+            outputs=[max_side, inference_type, single_person,
+                     save_compressed, render_mesh, cache_dir],
             queue=False,
         )
 
         run_btn.click(
             fn=runner.process,
-            inputs=[files, max_side, single_person, save_compressed, render_mesh, cache_dir, inference_type],
-            outputs=[npz_files, mesh_gallery, side_gallery, status, npz_files],
+            inputs=[files, max_side, single_person, save_compressed,
+                    render_mesh, cache_dir, inference_type],
+            outputs=[orig_img, skel_img, mesh_img, side_img, status, npz_files],
             queue=False,
         )
 
@@ -358,10 +529,12 @@ def build_app(checkpoint_path: str, mhr_path: str, output_dir: str):
 
 def parse_args():
     p = argparse.ArgumentParser(description="SAM3D thin GUI v3")
-    p.add_argument("--checkpoint_path", default="./checkpoints/sam-3d-body-dinov3/model.ckpt", type=str)
-    p.add_argument("--mhr_path", default="./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt", type=str)
-    p.add_argument("--output_dir", default="./output/gui", type=str)
-    p.add_argument("--host", default="127.0.0.1", type=str)
+    p.add_argument("--checkpoint_path",
+                   default="./checkpoints/sam-3d-body-dinov3/model.ckpt")
+    p.add_argument("--mhr_path",
+                   default="./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt")
+    p.add_argument("--output_dir", default="./output/gui")
+    p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", default=7862, type=int)
     return p.parse_args()
 
