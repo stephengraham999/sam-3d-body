@@ -121,19 +121,3 @@ output/
 **/.dist_test
 sandbox*
 *.sh
-
-# base_posescript isolation: large local-only directories
-# (data, vendor clones, virtual env — never commit these)
-base_posescript/.venv/
-base_posescript/_vendor_src/
-base_posescript/repo/data/
-base_posescript/repo/experiments/
-base_posescript/repo/dataset_cache/
-base_posescript/repo/tools/
-base_posescript/docs/*.log
-
-# sg_custom_modules: vendor build artifacts
-sg_custom_modules/patches/body_visualizer/
-sg_custom_modules/patches/configer/
-sg_custom_modules/patches/human_body_prior/
-sg_custom_modules/patches/mesh/
