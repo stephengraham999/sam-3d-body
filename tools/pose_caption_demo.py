@@ -5,13 +5,18 @@ Test GUI: JPEG → SAM 3D Body → PoseScript caption.
 
 Pipeline:
   1. User uploads a JPEG/PNG.
-  2. run_fast_infer()           →  output/caption_demo/npz/<stem>.npz
-  3. convert_npz_to_posescript() →  output/caption_demo/pt/<stem>.pt   (1×22×3, Y-up)
-  4. subprocess (base_posescript/.venv) posescript_caption_single.py    →  caption text
-  5. Display: original photo | 2D skeleton overlay | caption text box
+  2. run_fast_infer()              →  output/caption_demo/npz/<stem>.npz
+  3. convert_npz_to_posescript()   →  output/caption_demo/pt/<stem>.pt  (1×22×3, Y-up)
+  4. subprocess (base_posescript/.venv) posescript_caption_single.py     →  caption text
+  5. (optional) render_npz subprocess                                    →  mesh overlay
+  6. Display 2×2 grid:
+       [Top-left]     Original photo
+       [Top-right]    Caption text box
+       [Bottom-left]  Mesh overlay (if render_mesh enabled)
+       [Bottom-right] 2-D skeleton overlay
 
 Usage:
-    python tools/pose_caption_demo.py \\
+    /usr/bin/python3 tools/pose_caption_demo.py \\
         --checkpoint_path checkpoints/sam-3d-body-dinov3/model.ckpt \\
         --mhr_path       checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
 """
@@ -42,6 +47,7 @@ POSESCRIPT_RUNNER = os.path.join(
     _PROJECT_ROOT,
     "sg_custom_modules", "base_posescript", "posescript_caption_single.py",
 )
+RENDER_SCRIPT = os.path.join(_HERE, "render_npz.py")
 
 # Add project root to sys.path so sam_3d_body and sg_custom_modules are importable
 if _PROJECT_ROOT not in sys.path:
@@ -54,7 +60,7 @@ from sg_custom_modules.base_posescript.sam3d_to_posescript import (     # noqa: 
 
 
 # ---------------------------------------------------------------------------
-# 2-D skeleton drawing (subset from gui_app.py)
+# 2-D skeleton drawing
 # ---------------------------------------------------------------------------
 _BODY_LINKS = [
     (13, 11, (0, 200, 0)),   (11, 9,  (0, 200, 0)),
@@ -117,14 +123,28 @@ class CaptionPipeline:
     def __init__(self, checkpoint_path: str, mhr_path: str, output_dir: str):
         self.checkpoint_path = checkpoint_path
         self.mhr_path = mhr_path
-        self.npz_dir = os.path.join(output_dir, "npz")
-        self.pt_dir  = os.path.join(output_dir, "pt")
-        os.makedirs(self.npz_dir, exist_ok=True)
-        os.makedirs(self.pt_dir,  exist_ok=True)
+        self.npz_dir  = os.path.join(output_dir, "npz")
+        self.pt_dir   = os.path.join(output_dir, "pt")
+        self.mesh_dir = os.path.join(output_dir, "render")
+        os.makedirs(self.npz_dir,  exist_ok=True)
+        os.makedirs(self.pt_dir,   exist_ok=True)
+        os.makedirs(self.mesh_dir, exist_ok=True)
 
-    def run(self, file_obj) -> tuple:
-        """Returns (orig_img, skel_img, caption_text, status_str)."""
-        empty = (None, None, "", "No file selected.")
+    def run(
+        self,
+        file_obj,
+        max_side: int,
+        inference_type: str,
+        single_person: bool,
+        save_compressed: bool,
+        render_mesh: bool,
+        cache_dir: str,
+    ) -> tuple:
+        """
+        Returns (orig_img, caption_text, mesh_img, skel_img, status_str).
+        Matches outputs: [orig_img, caption_box, mesh_img, skel_img, status].
+        """
+        empty = (None, "", None, None, "No file selected.")
         if file_obj is None:
             return empty
 
@@ -134,6 +154,10 @@ class CaptionPipeline:
         pt_path  = os.path.join(self.pt_dir,  f"{stem}.pt")
         t0       = time.perf_counter()
 
+        infer_type = str(inference_type).strip().lower() if inference_type else "body"
+        if infer_type not in ("full", "body"):
+            infer_type = "body"
+
         # ---- Stage 1: SAM 3D Body inference --------------------------------
         try:
             run_fast_infer(
@@ -141,30 +165,31 @@ class CaptionPipeline:
                 output_dir=self.npz_dir,
                 checkpoint_path=self.checkpoint_path,
                 mhr_path=self.mhr_path,
-                max_side=1280,
-                single_person=True,
+                max_side=int(max_side),
+                single_person=bool(single_person),
                 map_2d_to_original=True,
-                save_compressed=False,
-                inference_type="body",
+                save_compressed=bool(save_compressed),
+                cache_dir=cache_dir.strip() if cache_dir else "",
+                bbox_thr=0.8,
+                inference_type=infer_type,
             )
         except Exception as e:
-            return None, None, "", f"Stage 1 SAM 3D Body failed: {e}"
+            return None, "", None, None, f"Stage 1 SAM 3D Body failed: {e}"
 
         infer_ms = (time.perf_counter() - t0) * 1000
 
         if not os.path.exists(npz_path):
-            return None, None, "", f"Stage 1: NPZ not produced at {npz_path}"
+            return None, "", None, None, f"Stage 1: NPZ not produced at {npz_path}"
 
-        # ---- Load visual outputs -------------------------------------------
         orig_img = _load_rgb(img_path)
         skel_img = _draw_skeleton(img_path, npz_path)
 
         # Check at least one person was detected
         try:
-            import numpy as _np
-            z = _np.load(npz_path, allow_pickle=False)
+            z = np.load(npz_path, allow_pickle=False)
             if int(z["num_people"]) == 0:
-                return orig_img, skel_img, "", "No person detected in image."
+                return orig_img, "No person detected in image.", None, skel_img, \
+                    f"No person detected. infer={infer_ms:.0f}ms"
         except Exception:
             pass
 
@@ -173,104 +198,174 @@ class CaptionPipeline:
         try:
             convert_npz_to_posescript(npz_path, pt_path)
         except Exception as e:
-            return orig_img, skel_img, "", f"Stage 2 conversion failed: {e}"
+            return orig_img, f"Conversion failed: {e}", None, skel_img, \
+                f"Stage 2 failed. infer={infer_ms:.0f}ms"
         conv_ms = (time.perf_counter() - t2) * 1000
 
-        # ---- Stage 3: PoseScript subprocess --------------------------------
+        # ---- Stage 3: PoseScript caption ------------------------------------
         t3 = time.perf_counter()
+        caption = ""
 
         if not os.path.exists(POSESCRIPT_VENV_PYTHON):
-            return orig_img, skel_img, "", (
-                f"PoseScript venv not found at {POSESCRIPT_VENV_PYTHON}. "
-                "Run base_posescript setup first."
+            caption = (
+                f"[PoseScript venv not found at {POSESCRIPT_VENV_PYTHON}. "
+                "Run base_posescript setup first.]"
             )
-
-        try:
-            proc = subprocess.run(
-                [
-                    POSESCRIPT_VENV_PYTHON,
-                    POSESCRIPT_RUNNER,
-                    "--input_pt", os.path.abspath(pt_path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-        except subprocess.TimeoutExpired:
-            return orig_img, skel_img, "", "Stage 3: PoseScript timed out (>120s)"
-        except Exception as e:
-            return orig_img, skel_img, "", f"Stage 3 subprocess error: {e}"
+        else:
+            try:
+                proc = subprocess.run(
+                    [
+                        POSESCRIPT_VENV_PYTHON,
+                        POSESCRIPT_RUNNER,
+                        "--input_pt", os.path.abspath(pt_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if proc.returncode != 0:
+                    caption = f"[PoseScript error rc={proc.returncode}]\n{proc.stderr.strip()}"
+                else:
+                    caption = proc.stdout.strip() or f"[empty output]\n{proc.stderr.strip()}"
+            except subprocess.TimeoutExpired:
+                caption = "[PoseScript timed out (>120s)]"
+            except Exception as e:
+                caption = f"[Subprocess error: {e}]"
 
         caption_ms = (time.perf_counter() - t3) * 1000
 
-        if proc.returncode != 0:
-            err = proc.stderr.strip()
-            return orig_img, skel_img, "", (
-                f"Stage 3 PoseScript failed (rc={proc.returncode}):\n{err}"
-            )
+        # ---- Stage 4: Mesh render (optional) --------------------------------
+        mesh_img = None
+        render_ms = 0.0
+        render_note = "skipped"
 
-        caption = proc.stdout.strip()
-        if not caption:
-            stderr = proc.stderr.strip()
-            return orig_img, skel_img, "", (
-                f"Stage 3: empty caption.\nstderr={stderr}"
-            )
+        if render_mesh:
+            t4 = time.perf_counter()
+            try:
+                out_dir = os.path.join(self.mesh_dir, stem)
+                os.makedirs(out_dir, exist_ok=True)
+                proc_r = subprocess.run(
+                    [
+                        sys.executable,
+                        RENDER_SCRIPT,
+                        "--npz", npz_path,
+                        "--output_dir", out_dir,
+                        "--image", img_path,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                render_ms = (time.perf_counter() - t4) * 1000
+                mesh_path = os.path.join(out_dir, "mesh_overlay.jpg")
+                if proc_r.returncode == 0 and os.path.exists(mesh_path):
+                    mesh_img = _load_rgb(mesh_path)
+                    render_note = f"ok render={render_ms:.0f}ms"
+                else:
+                    render_note = f"failed rc={proc_r.returncode}"
+            except Exception as e:
+                render_note = f"error ({e})"
 
-        # ---- Build status --------------------------------------------------
+        # ---- Status ---------------------------------------------------------
         ts = datetime.now().strftime("%H:%M:%S")
         status = (
             f"[{ts}]  infer={infer_ms:.0f}ms  "
             f"conv={conv_ms:.0f}ms  "
             f"caption={caption_ms:.0f}ms  "
-            f"npz={npz_path}"
+            f"render={render_note}  "
+            f"npz={os.path.basename(npz_path)}"
         )
 
-        return orig_img, skel_img, caption, status
+        return orig_img, caption, mesh_img, skel_img, status
 
 
 # ---------------------------------------------------------------------------
 # Gradio app
 # ---------------------------------------------------------------------------
 
+_CSS = """
+#ctrl-col { min-width: 280px !important; max-width: 340px !important; flex: 0 0 320px !important; }
+"""
+
+
 def build_app(checkpoint_path: str, mhr_path: str, output_dir: str) -> gr.Blocks:
     pipeline = CaptionPipeline(checkpoint_path, mhr_path, output_dir)
 
-    with gr.Blocks(title="Pose Caption Demo") as demo:
+    with gr.Blocks(title="Pose Caption Demo", css=_CSS) as demo:
         gr.Markdown(
             "## Pose Caption Demo\n"
             "Upload a JPEG/PNG → SAM 3D Body detects the pose → "
             "PoseScript generates a natural-language description."
         )
 
-        with gr.Row():
-            # Left: controls
-            with gr.Column(scale=1, min_width=260):
+        with gr.Row(equal_height=False):
+            # ----------------------------------------------------------------
+            # LEFT: fixed-width control panel (mirrors gui_app.py options)
+            # ----------------------------------------------------------------
+            with gr.Column(elem_id="ctrl-col", min_width=300):
                 file_in = gr.File(
                     label="Input image (JPEG / PNG)",
                     file_types=["image"],
                     file_count="single",
                 )
+                max_side = gr.Slider(
+                    0, 2000, value=1280, step=32,
+                    label="max_side (0 = no resize)",
+                )
+                inference_type = gr.Radio(
+                    choices=["full", "body"],
+                    value="body",
+                    label="Inference type  (body = faster, no hand detail)",
+                )
+                single_person   = gr.Checkbox(value=True,  label="Single person mode")
+                save_compressed = gr.Checkbox(value=False, label="Compress NPZ (slower)")
+                render_mesh     = gr.Checkbox(value=True,  label="Render mesh overlay")
+                cache_dir = gr.Textbox(
+                    value="./output/fast_npz_cache",
+                    label="Cache directory (optional)",
+                )
                 run_btn = gr.Button("▶  Generate caption", variant="primary")
                 status  = gr.Textbox(label="Status / timing", lines=3, interactive=False)
 
-            # Right: results
+            # ----------------------------------------------------------------
+            # RIGHT: 2×2 image grid
+            #   Top-left:     Original photo
+            #   Top-right:    Caption text box
+            #   Bottom-left:  Mesh overlay render
+            #   Bottom-right: 2-D skeleton
+            # ----------------------------------------------------------------
             with gr.Column(scale=3):
-                with gr.Row():
-                    orig_img = gr.Image(label="Original photo", type="numpy",
-                                        show_download_button=False)
-                    skel_img = gr.Image(label="2D skeleton", type="numpy",
-                                        show_download_button=False)
-                caption_box = gr.Textbox(
-                    label="PoseScript caption",
-                    lines=6,
-                    placeholder="Caption will appear here…",
-                    interactive=False,
-                )
+                with gr.Row(equal_height=True):
+                    orig_img = gr.Image(
+                        label="Original photo",
+                        type="numpy",
+                        show_download_button=False,
+                    )
+                    caption_box = gr.Textbox(
+                        label="PoseScript caption",
+                        lines=12,
+                        placeholder="Caption will appear here after running…",
+                        interactive=False,
+                    )
+                with gr.Row(equal_height=True):
+                    mesh_img = gr.Image(
+                        label="Mesh overlay",
+                        type="numpy",
+                        show_download_button=False,
+                    )
+                    skel_img = gr.Image(
+                        label="2D keypoints",
+                        type="numpy",
+                        show_download_button=False,
+                    )
 
         run_btn.click(
             fn=pipeline.run,
-            inputs=[file_in],
-            outputs=[orig_img, skel_img, caption_box, status],
+            inputs=[
+                file_in, max_side, inference_type,
+                single_person, save_compressed, render_mesh, cache_dir,
+            ],
+            outputs=[orig_img, caption_box, mesh_img, skel_img, status],
             queue=False,
         )
 
