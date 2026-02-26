@@ -7,30 +7,22 @@ coordinate tensor format expected by PoseScript's captioning pipeline.
 Background
 ----------
 SAM-3D-Body outputs a (70, 3) joint array in camera / OpenCV coordinates
-(Y points down, Z points forward toward the camera).  The first 22 joints
-follow the standard SMPL kinematic tree and map 1-to-1 to the 22 joints
-PoseScript's posecode engine expects.
+(Y points down, Z points forward toward the camera). The 70 rows follow
+the MHR70 keypoint order (nose/eyes/ears/limbs/hands/markers), not the
+SMPL22 order PoseScript expects.
+
+This module converts MHR70 keypoints into PoseScript's 22-joint SMPL-style
+layout by combining direct row mappings with synthetic joints:
+- pelvis from left/right hips
+- spine1/2 from pelvis -> spine3 interpolation
+- spine3 from left/right shoulder midpoint
+- collar joints from spine3 and shoulders
+- head from nose/neck midpoint
+- foot base joints from heel/big-toe midpoints
 
 PoseScript's ``compute_coords.py`` applies a -90 degree rotation around the
 X axis to every pose so that Y points up and the figure faces the viewer.
 This module replicates that exact transformation.
-
-Joint index mapping (first 22 only):
-    0  Pelvis (root)        13  Left Collar (clavicle)
-    1  Left Hip             14  Right Collar (clavicle)
-    2  Right Hip            15  Head (base)
-    3  Spine 1 (lower)      16  Left Shoulder
-    4  Left Knee            17  Right Shoulder
-    5  Right Knee           18  Left Elbow
-    6  Spine 2 (middle)     19  Right Elbow
-    7  Left Ankle           20  Left Wrist
-    8  Right Ankle          21  Right Wrist
-    9  Spine 3 (upper)
-    10 Left Foot (toe base)
-    11 Right Foot (toe base)
-    12 Neck
-
-Joints 22-69 (generic hands, MHR dense markers) are discarded.
 
 Usage (as a library)
 --------------------
@@ -68,6 +60,8 @@ import torch
 
 #: Number of SMPL base joints PoseScript operates on.
 N_POSESCRIPT_JOINTS: int = 22
+N_MHR70_JOINTS: int = 70
+AXIS_VARIANTS = ("flip_yz", "identity", "swap_xy", "swap_xz", "swap_yz")
 
 #: Rotation matrix: -90 degrees around the X axis.
 #:
@@ -98,6 +92,7 @@ def convert_npz_to_posescript(
     input_npz: Union[str, Path],
     output_pt: Union[str, Path],
     person_id: int = 0,
+    axis_variant: str = "flip_yz",
 ) -> torch.Tensor:
     """Convert a SAM-3D-Body NPZ file to a PoseScript-compatible .pt tensor.
 
@@ -112,6 +107,10 @@ def convert_npz_to_posescript(
     person_id:
         Index of the person to extract (default ``0`` → ``person_000_``).
         For single-person inference this is always 0.
+    axis_variant:
+        Axis transform applied after root-centering. Choices:
+        ``flip_yz`` (default), ``identity``, ``swap_xy``, ``swap_xz``,
+        ``swap_yz``.
 
     Returns
     -------
@@ -125,7 +124,7 @@ def convert_npz_to_posescript(
         If the expected ``person_{person_id:03d}_pred_keypoints_3d`` key is
         missing from the NPZ.
     ValueError
-        If the extracted joint array does not have at least 22 joints.
+        If the extracted joint array does not have at least 70 joints.
     """
     input_npz = Path(input_npz)
     output_pt = Path(output_pt)
@@ -145,18 +144,45 @@ def convert_npz_to_posescript(
 
     joints_np: np.ndarray = data[key]  # (70, 3) float32
 
-    if joints_np.shape[0] < N_POSESCRIPT_JOINTS:
+    if joints_np.shape[0] < N_MHR70_JOINTS:
         raise ValueError(
-            f"Expected at least {N_POSESCRIPT_JOINTS} joints, "
+            f"Expected at least {N_MHR70_JOINTS} joints, "
             f"but got shape {joints_np.shape}."
         )
 
     # ------------------------------------------------------------------
-    # 2. Slice the first 22 joints (discard hands + MHR dense markers)
+    # 2. MHR70 -> PoseScript 22 mapping
     # ------------------------------------------------------------------
-    joints: torch.Tensor = torch.from_numpy(
-        joints_np[:N_POSESCRIPT_JOINTS].astype(np.float32)
-    )  # (22, 3)
+    p = torch.from_numpy(joints_np.astype(np.float32))  # (70, 3)
+    joints = torch.zeros((N_POSESCRIPT_JOINTS, 3), dtype=torch.float32)
+
+    # Direct mappings
+    joints[1] = p[9]    # left_hip
+    joints[2] = p[10]   # right_hip
+    joints[4] = p[11]   # left_knee
+    joints[5] = p[12]   # right_knee
+    joints[7] = p[13]   # left_ankle
+    joints[8] = p[14]   # right_ankle
+    joints[12] = p[69]  # neck
+    joints[16] = p[5]   # left_shoulder
+    joints[17] = p[6]   # right_shoulder
+    joints[18] = p[7]   # left_elbow
+    joints[19] = p[8]   # right_elbow
+    joints[20] = p[62]  # left_wrist
+    joints[21] = p[41]  # right_wrist
+
+    # Synthetic torso/head/foot joints
+    pelvis = (p[9] + p[10]) / 2.0
+    spine3 = (p[5] + p[6]) / 2.0
+    joints[0] = pelvis
+    joints[9] = spine3
+    joints[3] = pelvis + (spine3 - pelvis) * (1.0 / 3.0)   # spine1
+    joints[6] = pelvis + (spine3 - pelvis) * (2.0 / 3.0)   # spine2
+    joints[13] = (spine3 + p[5]) / 2.0                      # left_collar
+    joints[14] = (spine3 + p[6]) / 2.0                      # right_collar
+    joints[15] = (p[0] + p[69]) / 2.0                       # head
+    joints[10] = (p[17] + p[15]) / 2.0                      # left_foot base
+    joints[11] = (p[20] + p[18]) / 2.0                      # right_foot base
 
     # ------------------------------------------------------------------
     # 3. Root-centre: translate so that the pelvis (joint 0) is at origin
@@ -165,13 +191,25 @@ def convert_npz_to_posescript(
     joints = joints - pelvis  # (22, 3)
 
     # ------------------------------------------------------------------
-    # 4. Coordinate-axis flip: camera Y-down → body Y-up
-    #    Replicates compute_coords.py:  transf(rotX, -90, j)
-    #    which does:  rotX(-90°) @ j.T  →  j_rotated
+    # 4. Optional axis transform for alignment experiments.
     # ------------------------------------------------------------------
-    # ROT_X_NEG90 is (3, 3); joints is (22, 3)
-    # Result = (joints @ ROT_X_NEG90.T) = (22, 3)
-    joints = joints @ ROT_X_NEG90.t()  # (22, 3)
+    axis_variant = str(axis_variant).strip().lower()
+    if axis_variant not in AXIS_VARIANTS:
+        raise ValueError(
+            f"Invalid axis_variant='{axis_variant}'. "
+            f"Expected one of: {AXIS_VARIANTS}"
+        )
+
+    if axis_variant == "flip_yz":
+        joints[:, 1] = -joints[:, 1]
+        joints[:, 2] = -joints[:, 2]
+    elif axis_variant == "swap_xy":
+        joints = joints[:, [1, 0, 2]]
+    elif axis_variant == "swap_xz":
+        joints = joints[:, [2, 1, 0]]
+    elif axis_variant == "swap_yz":
+        joints = joints[:, [0, 2, 1]]
+    # identity: no-op
 
     # ------------------------------------------------------------------
     # 5. Add a batch dimension → (1, 22, 3) matching PoseScript's format
@@ -220,6 +258,12 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="INT",
         help="Person index to extract (default: 0).",
     )
+    p.add_argument(
+        "--axis_variant",
+        default="flip_yz",
+        choices=list(AXIS_VARIANTS),
+        help="Axis transform variant (default: flip_yz).",
+    )
     return p
 
 
@@ -229,6 +273,7 @@ def main() -> None:
         input_npz=args.input_npz,
         output_pt=args.output_pt,
         person_id=args.person_id,
+        axis_variant=args.axis_variant,
     )
     # Quick sanity print
     print(f"Tensor shape : {list(tensor.shape)}")

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -33,6 +34,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 import gradio as gr
+import torch
 
 # ---------------------------------------------------------------------------
 # Project-root relative paths (this script lives in tools/)
@@ -48,6 +50,7 @@ POSESCRIPT_RUNNER = os.path.join(
     "sg_custom_modules", "base_posescript", "posescript_caption_single.py",
 )
 RENDER_SCRIPT = os.path.join(_HERE, "render_npz.py")
+AXIS_VIEW_SCRIPT = os.path.join(_HERE, "view_pose_pt_3d.py")
 
 # Add project root to sys.path so sam_3d_body and sg_custom_modules are importable
 if _PROJECT_ROOT not in sys.path:
@@ -115,6 +118,46 @@ def _load_rgb(path: str) -> np.ndarray | None:
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else None
 
 
+def _sam_npz_to_ps22_root_centered(npz_path: str, person_id: int = 0) -> np.ndarray:
+    """Build PoseScript 22 joints from MHR70, root-centered, in raw SAM XYZ frame."""
+    z = np.load(npz_path, allow_pickle=False)
+    key = f"person_{person_id:03d}_pred_keypoints_3d"
+    if key not in z:
+        raise KeyError(f"Missing key: {key}")
+    p = z[key].astype(np.float32)
+    if p.shape[0] < 70:
+        raise ValueError(f"Expected at least 70 keypoints, got {p.shape}")
+
+    ps = np.zeros((22, 3), dtype=np.float32)
+    ps[1] = p[9]      # L_Hip
+    ps[2] = p[10]     # R_Hip
+    ps[4] = p[11]     # L_Knee
+    ps[5] = p[12]     # R_Knee
+    ps[7] = p[13]     # L_Ankle
+    ps[8] = p[14]     # R_Ankle
+    ps[12] = p[69]    # Neck
+    ps[16] = p[5]     # L_Shoulder
+    ps[17] = p[6]     # R_Shoulder
+    ps[18] = p[7]     # L_Elbow
+    ps[19] = p[8]     # R_Elbow
+    ps[20] = p[62]    # L_Wrist
+    ps[21] = p[41]    # R_Wrist
+
+    pelvis = (p[9] + p[10]) / 2.0
+    spine3 = (p[5] + p[6]) / 2.0
+    ps[0] = pelvis
+    ps[9] = spine3
+    ps[3] = pelvis + (spine3 - pelvis) * (1.0 / 3.0)   # Spine1
+    ps[6] = pelvis + (spine3 - pelvis) * (2.0 / 3.0)   # Spine2
+    ps[13] = (spine3 + p[5]) / 2.0                     # L_Collar
+    ps[14] = (spine3 + p[6]) / 2.0                     # R_Collar
+    ps[15] = (p[0] + p[69]) / 2.0                      # Head
+    ps[10] = (p[17] + p[15]) / 2.0                     # L_Foot base
+    ps[11] = (p[20] + p[18]) / 2.0                     # R_Foot base
+
+    return ps - ps[0:1]
+
+
 # ---------------------------------------------------------------------------
 # Core pipeline
 # ---------------------------------------------------------------------------
@@ -139,12 +182,13 @@ class CaptionPipeline:
         save_compressed: bool,
         render_mesh: bool,
         cache_dir: str,
+        axis_variant: str,
     ) -> tuple:
         """
-        Returns (orig_img, caption_text, mesh_img, skel_img, status_str).
-        Matches outputs: [orig_img, caption_box, mesh_img, skel_img, status].
+        Returns (orig_img, caption_text, mesh_img, skel_img, axis_img, status_str).
+        Matches outputs: [orig_img, caption_box, mesh_img, skel_img, axis_img, status].
         """
-        empty = (None, "", None, None, "No file selected.")
+        empty = (None, "", None, None, None, "No file selected.")
         if file_obj is None:
             return empty
 
@@ -157,6 +201,9 @@ class CaptionPipeline:
         infer_type = str(inference_type).strip().lower() if inference_type else "body"
         if infer_type not in ("full", "body"):
             infer_type = "body"
+        axis_variant = str(axis_variant).strip().lower() if axis_variant else "swap_yz"
+        if axis_variant not in ("flip_yz", "identity", "swap_xy", "swap_xz", "swap_yz"):
+            axis_variant = "swap_yz"
 
         # ---- Stage 1: SAM 3D Body inference --------------------------------
         try:
@@ -174,12 +221,12 @@ class CaptionPipeline:
                 inference_type=infer_type,
             )
         except Exception as e:
-            return None, "", None, None, f"Stage 1 SAM 3D Body failed: {e}"
+            return None, "", None, None, None, f"Stage 1 SAM 3D Body failed: {e}"
 
         infer_ms = (time.perf_counter() - t0) * 1000
 
         if not os.path.exists(npz_path):
-            return None, "", None, None, f"Stage 1: NPZ not produced at {npz_path}"
+            return None, "", None, None, None, f"Stage 1: NPZ not produced at {npz_path}"
 
         orig_img = _load_rgb(img_path)
         skel_img = _draw_skeleton(img_path, npz_path)
@@ -188,7 +235,7 @@ class CaptionPipeline:
         try:
             z = np.load(npz_path, allow_pickle=False)
             if int(z["num_people"]) == 0:
-                return orig_img, "No person detected in image.", None, skel_img, \
+                return orig_img, "No person detected in image.", None, skel_img, None, \
                     f"No person detected. infer={infer_ms:.0f}ms"
         except Exception:
             pass
@@ -196,11 +243,41 @@ class CaptionPipeline:
         # ---- Stage 2: NPZ → .pt tensor -------------------------------------
         t2 = time.perf_counter()
         try:
-            convert_npz_to_posescript(npz_path, pt_path)
+            convert_npz_to_posescript(npz_path, pt_path, axis_variant=axis_variant)
         except Exception as e:
-            return orig_img, f"Conversion failed: {e}", None, skel_img, \
+            return orig_img, f"Conversion failed: {e}", None, skel_img, None, \
                 f"Stage 2 failed. infer={infer_ms:.0f}ms"
         conv_ms = (time.perf_counter() - t2) * 1000
+
+        # ---- Stage 2.5: axis-variant + raw-SAM stickman preview ----------
+        axis_img = None
+        axis_note = "skipped"
+        try:
+            compare_png = os.path.join(self.pt_dir, f"{stem}_axes_compare.png")
+            raw_pt = os.path.join(self.pt_dir, f"{stem}_sam3d_raw.pt")
+            raw_pose = _sam_npz_to_ps22_root_centered(npz_path, person_id=0)
+            torch.save(torch.from_numpy(raw_pose).unsqueeze(0), raw_pt)
+            proc_cmp = subprocess.run(
+                [
+                    sys.executable,
+                    AXIS_VIEW_SCRIPT,
+                    "--input_pt", os.path.abspath(pt_path),
+                    "--input_raw_pt", os.path.abspath(raw_pt),
+                    "--compare_variants",
+                    "--show_ids",
+                    "--output_png", os.path.abspath(compare_png),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if proc_cmp.returncode == 0 and os.path.exists(compare_png):
+                axis_img = _load_rgb(compare_png)
+                axis_note = "ok"
+            else:
+                axis_note = f"failed rc={proc_cmp.returncode}"
+        except Exception:
+            axis_note = "error"
 
         # ---- Stage 3: PoseScript caption ------------------------------------
         t3 = time.perf_counter()
@@ -273,10 +350,12 @@ class CaptionPipeline:
             f"conv={conv_ms:.0f}ms  "
             f"caption={caption_ms:.0f}ms  "
             f"render={render_note}  "
+            f"axis_preview={axis_note}  "
+            f"axis={axis_variant}  "
             f"npz={os.path.basename(npz_path)}"
         )
 
-        return orig_img, caption, mesh_img, skel_img, status
+        return orig_img, caption, mesh_img, skel_img, axis_img, status
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +403,11 @@ def build_app(checkpoint_path: str, mhr_path: str, output_dir: str) -> gr.Blocks
                     value="./output/fast_npz_cache",
                     label="Cache directory (optional)",
                 )
+                axis_variant = gr.Radio(
+                    choices=["swap_yz", "flip_yz", "identity", "swap_xy", "swap_xz"],
+                    value="swap_yz",
+                    label="Axis variant (NPZ→PoseScript conversion)",
+                )
                 run_btn = gr.Button("▶  Generate caption", variant="primary")
                 status  = gr.Textbox(label="Status / timing", lines=3, interactive=False)
 
@@ -358,14 +442,20 @@ def build_app(checkpoint_path: str, mhr_path: str, output_dir: str) -> gr.Blocks
                         type="numpy",
                         show_download_button=False,
                     )
+                with gr.Row(equal_height=True):
+                    axis_img = gr.Image(
+                        label="Axis Variant Comparison + Raw SAM XYZ (6-way stickman)",
+                        type="numpy",
+                        show_download_button=False,
+                    )
 
         run_btn.click(
             fn=pipeline.run,
             inputs=[
                 file_in, max_side, inference_type,
-                single_person, save_compressed, render_mesh, cache_dir,
+                single_person, save_compressed, render_mesh, cache_dir, axis_variant,
             ],
-            outputs=[orig_img, caption_box, mesh_img, skel_img, status],
+            outputs=[orig_img, caption_box, mesh_img, skel_img, axis_img, status],
             queue=False,
         )
 
@@ -392,10 +482,69 @@ def _parse_args() -> argparse.Namespace:
                    default=os.path.join(_PROJECT_ROOT, "output/caption_demo"))
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", default=7863, type=int)
+    p.add_argument(
+        "--kill_other_instances",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Terminate other running pose_caption_demo.py processes before launch.",
+    )
     return p.parse_args()
+
+
+def _kill_other_demo_instances() -> None:
+    """Terminate other running pose_caption_demo.py processes for this user."""
+    me = os.getpid()
+    script_marker = "tools/pose_caption_demo.py"
+    try:
+        proc = subprocess.run(
+            ["ps", "-ax", "-o", "pid=,command="],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return
+
+    victims: list[int] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid_s, cmd = parts
+        if script_marker not in cmd:
+            continue
+        try:
+            pid = int(pid_s)
+        except ValueError:
+            continue
+        if pid != me:
+            victims.append(pid)
+
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+
+    if victims:
+        time.sleep(0.4)
+        for pid in victims:
+            try:
+                os.kill(pid, 0)
+            except Exception:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
     args = _parse_args()
+    if args.kill_other_instances:
+        _kill_other_demo_instances()
     app = build_app(args.checkpoint_path, args.mhr_path, args.output_dir)
     app.launch(server_name=args.host, server_port=args.port)

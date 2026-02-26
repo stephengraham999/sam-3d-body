@@ -19,12 +19,19 @@ venv) captures stdout to retrieve the caption.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 import torch
+
+
+def _resolve_flag(value: bool | None, default_value: bool) -> bool:
+    return default_value if value is None else bool(value)
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +47,48 @@ def main() -> None:
         required=True,
         metavar="PATH",
         help="Path to a .pt file containing a (1, 22, 3) pose tensor.",
+    )
+    p.add_argument(
+        "--save_dir",
+        default="",
+        metavar="PATH",
+        help="Optional directory to store PoseScript intermediates.",
+    )
+    p.add_argument(
+        "--simplified_captions",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable simplified captions. Default preserves legacy behavior (enabled).",
+    )
+    p.add_argument(
+        "--random_skip",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable random skipping. Default preserves legacy behavior (enabled).",
+    )
+    p.add_argument(
+        "--apply_transrel_ripple_effect",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable transitive-relation ripple effect. Default: disabled.",
+    )
+    p.add_argument(
+        "--apply_stat_ripple_effect",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable statistical ripple effect. Default: disabled.",
+    )
+    p.add_argument(
+        "--add_babel_info",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable BABEL sentence prefixing. Default: disabled.",
+    )
+    p.add_argument(
+        "--add_dancing_info",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable dancing sentence tagging. Default: disabled.",
     )
     args = p.parse_args()
 
@@ -71,20 +120,42 @@ def main() -> None:
 
     # ------------------------------------------------------------------
     # 3. Run the captioning pipeline
-    #    - use_contact_codes=False  → skip contact-code path (needs selfcontact)
-    #    - simplified_captions=True → shorter, cleaner output sentences
-    #    - random_skip=True         → non-deterministic but avoids verbose output
-    #    - save_dir=tmpdir          → write intermediate .pt files to temp location
+    #    Preserve legacy defaults unless flags are explicitly provided.
     # ------------------------------------------------------------------
-    with tempfile.TemporaryDirectory(prefix="posescript_single_") as tmpdir:
+    simplified_captions = _resolve_flag(args.simplified_captions, True)
+    random_skip = _resolve_flag(args.random_skip, True)
+    apply_transrel_ripple_effect = _resolve_flag(args.apply_transrel_ripple_effect, False)
+    apply_stat_ripple_effect = _resolve_flag(args.apply_stat_ripple_effect, False)
+    add_babel_info = _resolve_flag(args.add_babel_info, False)
+    add_dancing_info = _resolve_flag(args.add_dancing_info, False)
+    babel_info = False
+    if add_babel_info:
+        default_sent = "They are dancing. " if add_dancing_info else ""
+        babel_info = [default_sent for _ in range(coords.shape[0])]
+
+    tmp_ctx = tempfile.TemporaryDirectory(prefix="posescript_single_")
+    if args.save_dir:
+        save_dir = Path(args.save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        tmp_ctx = None
+    else:
+        save_dir = None
+
+    try:
+        active_save_dir = str(save_dir) if save_dir is not None else tmp_ctx.__enter__()
         try:
-            captioning_main(
-                coords=coords,
-                use_contact_codes=False,
-                simplified_captions=True,
-                random_skip=True,
-                save_dir=tmpdir,
-            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                captioning_main(
+                    coords=coords,
+                    use_contact_codes=False,
+                    simplified_captions=simplified_captions,
+                    random_skip=random_skip,
+                    apply_transrel_ripple_effect=apply_transrel_ripple_effect,
+                    apply_stat_ripple_effect=apply_stat_ripple_effect,
+                    babel_info=babel_info,
+                    verbose=False,
+                    save_dir=active_save_dir,
+                )
         except Exception as e:
             print(f"ERROR: captioning_main failed: {type(e).__name__}: {e}", file=sys.stderr)
             sys.exit(1)
@@ -92,13 +163,16 @@ def main() -> None:
         # ------------------------------------------------------------------
         # 4. Read the saved descriptions
         # ------------------------------------------------------------------
-        desc_file = os.path.join(tmpdir, "descriptions.json")
+        desc_file = os.path.join(active_save_dir, "descriptions.json")
         if not os.path.exists(desc_file):
             print("ERROR: descriptions.json was not created", file=sys.stderr)
             sys.exit(1)
 
         with open(desc_file) as f:
             descriptions: dict = json.load(f)
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.__exit__(None, None, None)
 
     # ------------------------------------------------------------------
     # 5. Print the caption(s) to stdout

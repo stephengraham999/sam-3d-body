@@ -12,7 +12,8 @@ spec.loader.exec_module(mod)
 # ---- Build a fake SAM-3D-Body NPZ ----
 rng = np.random.default_rng(42)
 fake_joints = rng.standard_normal((70, 3)).astype(np.float32)
-fake_joints[0] = [0.5, 1.0, 0.3]   # non-zero pelvis → must become [0,0,0] after centering
+fake_joints[9] = [0.6, -0.1, 0.2]    # left_hip
+fake_joints[10] = [-0.4, -0.2, 0.0]  # right_hip
 
 tmpdir = tempfile.mkdtemp()
 npz_path = os.path.join(tmpdir, "test.npz")
@@ -36,13 +37,42 @@ reloaded = torch.load(pt_path)
 assert torch.allclose(tensor, reloaded), "Save/reload mismatch"
 print(f"Reload : OK")
 
-# ---- Check rotation ----
-j1_cam_centred = torch.tensor(fake_joints[1] - fake_joints[0])
-j1_body_expected = j1_cam_centred @ mod.ROT_X_NEG90.t()
-j1_body_actual   = tensor[0, 1]
-assert torch.allclose(j1_body_expected, j1_body_actual, atol=1e-5), \
-    f"Rotation mismatch:\n  expected {j1_body_expected}\n  got      {j1_body_actual}"
-print(f"Rotation: OK")
+# ---- Check mapping against explicit expected construction ----
+p = torch.tensor(fake_joints, dtype=torch.float32)
+expected = torch.zeros((22, 3), dtype=torch.float32)
+expected[1] = p[9]
+expected[2] = p[10]
+expected[4] = p[11]
+expected[5] = p[12]
+expected[7] = p[13]
+expected[8] = p[14]
+expected[12] = p[69]
+expected[16] = p[5]
+expected[17] = p[6]
+expected[18] = p[7]
+expected[19] = p[8]
+expected[20] = p[62]
+expected[21] = p[41]
+
+pelvis = (p[9] + p[10]) / 2.0
+spine3 = (p[5] + p[6]) / 2.0
+expected[0] = pelvis
+expected[9] = spine3
+expected[3] = pelvis + (spine3 - pelvis) * (1.0 / 3.0)
+expected[6] = pelvis + (spine3 - pelvis) * (2.0 / 3.0)
+expected[13] = (spine3 + p[5]) / 2.0
+expected[14] = (spine3 + p[6]) / 2.0
+expected[15] = (p[0] + p[69]) / 2.0
+expected[10] = (p[17] + p[15]) / 2.0
+expected[11] = (p[20] + p[18]) / 2.0
+
+expected = expected - expected[0]
+expected[:, 1] = -expected[:, 1]
+expected[:, 2] = -expected[:, 2]
+
+assert torch.allclose(expected, tensor[0], atol=1e-5), \
+    "Mapped joints do not match expected values."
+print(f"Mapping: OK")
 
 print()
 print("ALL CHECKS PASSED")
